@@ -4771,18 +4771,23 @@ int main(int argc, char **argv, char **envp)
         return 0;
     }
 
-    start_io_router();
+    /* [Insert Code] We insert our check in here -by JoeKing0806*/
+	dsm_param_init();
+	dsm_auto_setup();
 
-    if (incoming) {
-        Error *local_err = NULL;
-        qemu_start_incoming_migration(incoming, &local_err);
-        if (local_err) {
-            error_reportf_err(local_err, "-incoming %s: ", incoming);
-            exit(1);
-        }
-    } else if (autostart) {
-        vm_start();
-    }
+	/* [Original Code] keep the original IO Router */
+	start_io_router();
+
+	if (incoming) {
+  		Error *local_err = NULL;
+    	qemu_start_incoming_migration(incoming, &local_err);
+   		if (local_err) {
+        	error_reportf_err(local_err, "-incoming %s: ", incoming);
+        	exit(1);
+    	}
+	} else if (autostart) {
+    	vm_start();
+	}
 
     os_setup_post();
 
