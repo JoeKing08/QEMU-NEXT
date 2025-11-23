@@ -1,4 +1,3 @@
-/* dsm_backend.c */
 #include "qemu/osdep.h"
 #include "qemu/thread.h"
 #include "dsm_backend.h"
@@ -12,34 +11,28 @@
 #include <arpa/inet.h>
 #include <sched.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #ifndef __NR_userfaultfd
 #define __NR_userfaultfd 323
 #endif
 
 // === 配置区 ===
-#define THREAD_COUNT 8 
-#define PREFETCH_COUNT 32
-#define TCP_BUF_SIZE (2 * 1024 * 1024)
+#define THREAD_COUNT 8
+#define PREFETCH 32
 #define PAGE_SIZE 4096
+#define TCP_BUF_SIZE (2 * 1024 * 1024)
 
-// [部署必改] 集群内存节点 IP 列表
-const char *NODE_IPS[] = {
-    "127.0.0.1", 
-    // "192.168.1.101",
-    // "192.168.1.102"
-};
-#define NODE_COUNT (sizeof(NODE_IPS)/sizeof(NODE_IPS[0]))
-
-#define PROTO_ZERO 0xAA
-#define PROTO_DATA 0xBB
-
-int dsm_mode = 0; // 0: Off, 1: KVM+UFFD, 2: TCG+UFFD
+// 全局状态
+int gvm_mode = 0; 
 int uffd_fd = -1;
-int global_sockets[128];
 
-static void optimize_sock(int s) {
-    int f = 1, b = TCP_BUF_SIZE;
+// UFFD模式下的节点管理
+char **node_ips = NULL;
+int node_count = 0;
+
+static void optimize_socket(int s) {
+    int f=1, b=TCP_BUF_SIZE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&f, sizeof(int));
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&b, sizeof(int));
     setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&b, sizeof(int));
@@ -48,25 +41,47 @@ static void optimize_sock(int s) {
 static int connect_node(const char *ip) {
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) return -1;
-    optimize_sock(s);
+    optimize_socket(s);
     struct sockaddr_in a;
     a.sin_family = AF_INET;
-    a.sin_port = htons(9999);
+    a.sin_port = htons(9999); // 内存服务默认端口
     if (inet_pton(AF_INET, ip, &a.sin_addr)<=0) { close(s); return -1; }
     if (connect(s, (struct sockaddr*)&a, sizeof(a))<0) { close(s); return -1; }
     return s;
 }
 
+// 读取配置文件 cluster_uffd.conf
+static void load_config(void) {
+    FILE *f = fopen("cluster_uffd.conf", "r");
+    if (!f) {
+        // 默认单机回环
+        node_count = 1;
+        node_ips = malloc(sizeof(char*));
+        node_ips[0] = strdup("127.0.0.1");
+        return;
+    }
+    char line[128];
+    while (fgets(line, sizeof(line), f)) if(line[0]!='\n') node_count++;
+    rewind(f);
+    node_ips = malloc(sizeof(char*) * node_count);
+    int i=0;
+    while (fgets(line, sizeof(line), f) && i<node_count) {
+        line[strcspn(line, "\n")] = 0;
+        node_ips[i++] = strdup(line);
+    }
+    fclose(f);
+}
+
 void *dsm_worker(void *arg) {
     struct uffd_msg msg;
-    char buf[PAGE_SIZE * PREFETCH_COUNT];
+    char buf[PAGE_SIZE * PREFETCH];
     
-    // 尝试提权
+    // 尝试开启实时优先级 (需sudo)
     struct sched_param p = { .sched_priority = 10 };
     pthread_setschedparam(pthread_self(), SCHED_RR, &p);
 
-    int my_socks[128];
-    for(int i=0; i<NODE_COUNT; i++) my_socks[i] = connect_node(NODE_IPS[i]);
+    int *socks = malloc(sizeof(int)*node_count);
+    for(int i=0; i<node_count; i++) socks[i] = connect_node(node_ips[i]);
 
     while(1) {
         if (read(uffd_fd, &msg, sizeof(msg)) != sizeof(msg)) continue;
@@ -74,58 +89,74 @@ void *dsm_worker(void *arg) {
             uint64_t addr = msg.arg.pagefault.address;
             uint64_t base = addr & ~(4095);
             
-            int owner = (base / 4096) % NODE_COUNT;
-            int sock = my_socks[owner];
-            if (sock < 0) continue;
+            // 简单的取模分片
+            int owner = (base / 4096) % node_count;
+            int s = socks[owner];
+            if (s < 0) continue;
 
             uint64_t req = htobe64(base);
-            if (send(sock, &req, 8, 0) != 8) continue;
+            if (send(s, &req, 8, 0) != 8) continue;
 
-            for (int i=0; i<PREFETCH_COUNT; i++) {
-                uint64_t curr = base + (i*4096);
-                uint8_t type;
-                if (recv(sock, &type, 1, 0) <= 0) break;
-                
-                if (type == PROTO_ZERO) {
-                    struct uffdio_zeropage z = { .range = {curr, 4096}, .mode = 0 };
-                    ioctl(uffd_fd, UFFDIO_ZEROPAGE, &z);
-                } else {
-                    int recvd = 0;
-                    while (recvd < 4096) {
-                        int n = recv(sock, buf + recvd, 4096 - recvd, 0);
-                        if (n<=0) goto next;
-                        recvd += n;
-                    }
-                    struct uffdio_copy c = { .dst = curr, .src = (uint64_t)buf, .len = 4096, .mode = 0 };
-                    ioctl(uffd_fd, UFFDIO_COPY, &c);
-                }
+            int total = PAGE_SIZE * PREFETCH;
+            int recvd = 0;
+            while(recvd < total) {
+                int n = recv(s, buf + recvd, total - recvd, 0);
+                if (n<=0) break;
+                recvd += n;
             }
-            next:;
+
+            for(int k=0; k<PREFETCH; k++) {
+                struct uffdio_copy c = {
+                    .dst = base + k*4096,
+                    .src = (uint64_t)(buf + k*4096),
+                    .len = 4096, .mode = 0
+                };
+                ioctl(uffd_fd, UFFDIO_COPY, &c);
+            }
         }
     }
     return NULL;
 }
 
-void dsm_param_init(void) { } // 预留接口
+// === 核心分流逻辑 ===
+void dsm_universal_init(void) {
+    // 1. 检测 GiantVM 内核模块是否加载
+    // GiantVM 模块加载后通常会创建 /dev/giantvm
+    if (access("/dev/giantvm", F_OK) == 0) {
+        printf("[GiantVM] DETECTED CUSTOM KERNEL. Switching to ORIGINAL Mode.\n");
+        gvm_mode = 0; // 关闭 UFFD 逻辑，交还给原版代码
+        return;
+    }
 
-void dsm_auto_setup(void) {
-    bool has_kvm = (access("/dev/kvm", R_OK|W_OK) == 0);
+    // 2. 无内核模块，进入 UFFD 模式
+    printf("[GiantVM] NO Custom Kernel. Switching to MEMORY-ONLY (UFFD) Mode.\n");
+    gvm_mode = 1;
+
+    // 检测标准 KVM 状态 (仅做提示)
+    if (access("/dev/kvm", R_OK|W_OK) == 0) {
+        printf("[GiantVM] Standard KVM detected. Using Hardware Acceleration.\n");
+    } else {
+        printf("[GiantVM] No KVM. Falling back to TCG (Software).\n");
+    }
+
+    load_config();
     uffd_fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
     if (uffd_fd >= 0) {
         struct uffdio_api api = { .api = UFFD_API, .features = 0 };
-        if (ioctl(uffd_fd, UFFDIO_API, &api) == 0) {
-            dsm_mode = has_kvm ? 1 : 2;
-            printf("[GiantVM] ULT Mode: ON (KVM: %d, Nodes: %ld)\n", has_kvm, NODE_COUNT);
-            for(int i=0; i<THREAD_COUNT; i++) {
-                char n[32]; snprintf(n, 32, "dsm-%d", i);
-                qemu_thread_create(NULL, n, dsm_worker, NULL, QEMU_THREAD_JOINABLE);
-            }
+        ioctl(uffd_fd, UFFDIO_API, &api);
+        // 启动 worker 线程池
+        for(int i=0; i<THREAD_COUNT; i++) {
+            qemu_thread_create(NULL, "dsm-w", dsm_worker, NULL, QEMU_THREAD_JOINABLE);
         }
+    } else {
+        printf("[GiantVM] FATAL: Failed to init Userfaultfd.\n");
     }
 }
 
-void dsm_register_ram(void *ptr, size_t size) {
-    if (dsm_mode) {
+void dsm_universal_register(void *ptr, size_t size) {
+    // 只有在 UFFD 模式下才手动注册
+    // 原版模式下，GiantVM 的 ioctl 会自己处理
+    if (gvm_mode == 1 && uffd_fd >= 0) {
         struct uffdio_register r = { .range = {(uint64_t)ptr, size}, .mode = UFFDIO_REGISTER_MODE_MISSING };
         ioctl(uffd_fd, UFFDIO_REGISTER, &r);
     }
