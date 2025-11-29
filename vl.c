@@ -1,5 +1,5 @@
 /*
- * QEMU System Emulator
+ * QEMU System Emulator 
  *
  * Copyright (c) 2003-2008 Fabrice Bellard
  * Copyright (c) 2018 Trusted Cloud Group, Shanghai Jiao Tong University
