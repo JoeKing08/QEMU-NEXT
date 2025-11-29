@@ -92,7 +92,7 @@ static int connect_node_impl(const char *ip) {
 /* 
  * [CRITICAL FIX] 获取连接并锁定
  * 返回值: Socket FD (>=0) 表示成功，且 conn_locks[node_id] 处于 LOCKED 状态。
- *        -1 表示失败，锁已被释放。
+ *       -1 表示失败，锁已被释放。
  */
 static int get_or_connect_locked(int node_id) {
     if (node_id < 0 || node_id >= NODE_COUNT) return -1;
