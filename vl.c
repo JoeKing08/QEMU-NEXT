@@ -4463,6 +4463,9 @@ int main(int argc, char **argv, char **envp)
 
     configure_accelerator(current_machine);
 
+	/* [GiantVM Universal] 自动检测与初始化 */
+    dsm_universal_init();
+
     if (qtest_chrdev) {
         qtest_init(qtest_chrdev, qtest_log, &error_fatal);
     }
@@ -4771,9 +4774,6 @@ int main(int argc, char **argv, char **envp)
         dump_vmstate_json_to_file(vmstate_dump_file);
         return 0;
     }
-
-    /* [GiantVM Universal] 自动检测与初始化 */
-    dsm_universal_init();
 
     start_io_router();
 
