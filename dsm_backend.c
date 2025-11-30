@@ -58,10 +58,10 @@ static int connect_node_impl(const char *ip) {
     setsockopt(s, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
 
     /* 2. 基础性能优化 */
-    int flag = 1, bufsize = 4 * 1024 * 1024;
+    //int flag = 1, bufsize = 4 * 1024 * 1024;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(int));
-    setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufsize, sizeof(int));
-    setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&bufsize, sizeof(int));
+    //setsockopt(s, SOL_SOCKET, SO_RCVBUF, (char*)&bufsize, sizeof(int));
+    //setsockopt(s, SOL_SOCKET, SO_SNDBUF, (char*)&bufsize, sizeof(int));
 
     /* 3. KeepAlive (防止静默断开) */
     int keepalive = 1, keepidle = 5, keepintvl = 2, keepcnt = 3;
