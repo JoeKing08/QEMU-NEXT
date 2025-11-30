@@ -181,27 +181,65 @@ void *dsm_worker(void *arg) {
                 usleep(1000 * retry_cnt); 
             }
             
-            /* 3. [CRITICAL FIX] 兜底逻辑：防止死锁 */
+            /* 3. [CRITICAL FIX] 体验优先的权衡方案：短时间等待 + 快速降级 */
             if (sock < 0) {
-                fprintf(stderr, "[DSM] FATAL: Node %d unreachable after retries. Zero-filling %lx to unblock vCPU.\n", owner, base);
-                
-                // 必须填充一个零页，否则 vCPU 会永远停在这一行汇编指令上等待
-                struct uffdio_zeropage z = { 
-                    .range = { .start = base, .len = 4096 }, 
-                    .mode = 0 
-                };
-                if (ioctl(uffd_fd, UFFDIO_ZEROPAGE, &z) < 0) {
-                    // 如果页面已存在(EEXIST)，唤醒即可
-                    if (errno == EEXIST) {
-                         struct uffdio_wake w = { .start = base, .len = 4096, .mode = 0 };
-                         ioctl(uffd_fd, UFFDIO_WAKE, &w);
-                    } else {
-                        perror("[DSM] Emergency zeropage failed");
+                /*
+                 * 无法立即连接。我们进行短暂的、带超时的重试。
+                 * 这个策略旨在优先保证流畅体验，快速从网络抖动中恢复，
+                 * 同时在发生更严重的网络问题时，能迅速降级为零页填充，避免长时间卡死。
+                 */
+                const int STALL_TIMEOUT_MS = 500;  // 设置500毫秒的等待超时，以优先保证体验
+                const int RETRY_INTERVAL_MS = 50;  // 每50毫秒重试一次，更频繁地检查恢复状态
+                int total_wait_ms = 0;
+                bool connected = false;
+
+                // 打印一条信息日志，而不是致命错误，表明系统正在尝试恢复
+                fprintf(stderr, "[DSM] INFO: Node %d unreachable. Stalling for up to %dms on %lx...\n", 
+                        owner, STALL_TIMEOUT_MS, base);
+
+                // 在超时时间内循环尝试重连
+                while (total_wait_ms < STALL_TIMEOUT_MS) {
+                    usleep(RETRY_INTERVAL_MS * 1000);
+                    total_wait_ms += RETRY_INTERVAL_MS;
+
+                    sock = get_or_connect_locked(owner);
+                    if (sock >= 0) {
+                        connected = true;
+                        fprintf(stderr, "[DSM] INFO: Connection to node %d restored after %dms.\n", owner, total_wait_ms);
+                        break; // 连接成功，跳出等待循环
                     }
                 }
+
+                // 如果超时后依然无法连接
+                if (!connected) {
+                    /*
+                     * 等待超时后，我们判定这是一个持续性故障。
+                     * 为了保证VM不被永久冻结，执行最终的降级策略：填充零页。
+                     * 这样可以立即恢复VM的响应，代价是当前缺页的数据会出错。
+                     */
+                    fprintf(stderr, "[DSM] WARN: Node %d unreachable after %dms. Zero-filling %lx to unblock vCPU.\n", 
+                            owner, STALL_TIMEOUT_MS, base);
+                    
+                    struct uffdio_zeropage z = { 
+                        .range = { .start = base, .len = 4096 }, 
+                        .mode = 0 
+                    };
+
+                    if (ioctl(uffd_fd, UFFDIO_ZEROPAGE, &z) < 0) {
+                        // 竞争条件下，页面可能已经被别的线程或操作填充，这没关系
+                        if (errno == EEXIST) {
+                             struct uffdio_wake w = { .range = { .start = base, .len = 4096 }};
+                             ioctl(uffd_fd, UFFDIO_WAKE, &w);
+                        } else {
+                            perror("[DSM] Emergency zeropage failed");
+                        }
+                    }
+                    
+                    // 既然已经处理（或放弃）了这个缺页事件，就继续处理下一个事件
+                    continue; 
+                }
                 
-                // 跳过后续网络操作，处理下一个事件
-                continue; 
+                /* 如果代码执行到这里，说明在500毫秒内连接成功了，sock已经是有效值，后续的网络收发逻辑会正常执行 */
             }
 
             /* 4. 发送请求 */
